@@ -1,0 +1,366 @@
+#!/bin/zsh
+#
+# omarchy-theme: Omarchy-style theme switching for macOS.
+#
+# Pulls the official themes from github.com/basecamp/omarchy and applies them to
+# Ghostty, Neovim (LazyVim), btop, the desktop wallpaper and the macOS
+# light/dark appearance — the same way `omarchy-theme-set` does on Arch.
+#
+# Each Omarchy theme is a directory holding one colors.toml. Omarchy renders the
+# app configs from it with the templates in default/themed/*.tpl, so this script
+# does the same: it renders those templates into the current-theme directory and
+# points every app at that directory once.
+
+emulate zsh
+setopt no_unset pipe_fail extended_glob null_glob
+
+OMARCHY_REPO="${OMARCHY_REPO:-https://github.com/basecamp/omarchy.git}"
+DATA_DIR="$HOME/.local/share/omarchy-theme"
+REPO_DIR="$DATA_DIR/omarchy"
+USER_THEMES_DIR="$HOME/.config/omarchy-theme/themes"
+STATE_DIR="$HOME/.local/state/omarchy-theme"
+CURRENT_DIR="$STATE_DIR/current"
+BACKUP_DIR="$STATE_DIR/backup"
+
+GHOSTTY_CONFIG="$HOME/Library/Application Support/com.mitchellh.ghostty/config.ghostty"
+NVIM_THEME_LINK="$HOME/.config/nvim/lua/plugins/omarchy-theme.lua"
+BTOP_DIR="$HOME/.config/btop"
+
+die()  { print -u2 -- "omarchy-theme: $*"; exit 1 }
+info() { print -- "  $*" }
+
+usage() {
+  cat <<EOF
+Usage: omarchy-theme <command> [args]
+
+  update              Download the Omarchy themes, or pull the latest ones
+  list                List the available themes (* marks the current one)
+  set <theme>         Apply a theme, e.g. "tokyo-night" or "Tokyo Night"
+  next                Apply the next theme in the list
+  current             Print the current theme
+  bg-next             Cycle to the theme's next wallpaper
+  install <git-url>   Install a community theme from a git repo
+  remove <theme>      Remove a community theme
+EOF
+}
+
+# --- Themes -----------------------------------------------------------------
+
+# "Tokyo Night" -> "tokyo-night"
+slugify() { print -r -- "${${(L)1}// /-}" }
+
+# "tokyo-night" -> "Tokyo Night"
+titleize() { print -r -- "${(C)${1//-/ }}" }
+
+theme_names() {
+  local -a names
+  names=( "$USER_THEMES_DIR"/*(/N:t) "$REPO_DIR"/themes/*(/N:t) )
+  print -rl -- ${(ou)names}
+}
+
+# User-installed themes win over official ones with the same name.
+theme_dir() {
+  local slug=$(slugify "$1")
+  if [[ -d $USER_THEMES_DIR/$slug ]]; then
+    print -r -- "$USER_THEMES_DIR/$slug"
+  elif [[ -d $REPO_DIR/themes/$slug ]]; then
+    print -r -- "$REPO_DIR/themes/$slug"
+  fi
+}
+
+is_user_theme() { [[ $1 == $USER_THEMES_DIR/* ]] }
+
+current_theme() { [[ -f $STATE_DIR/theme.name ]] && <"$STATE_DIR/theme.name" }
+
+ensure_repo() {
+  [[ -d $REPO_DIR/themes ]] && return
+  print "No themes downloaded yet, fetching them first."
+  cmd_update
+}
+
+# --- Colors -----------------------------------------------------------------
+
+typeset -gA C
+
+# Blend two #rrggbb colors; the percentage is how much of the second one.
+mix() {
+  local a=${1#\#} b=${2#\#} pct=${3%\%} out="#" i x y
+  for i in 1 3 5; do
+    x=$(( 16#${a[i,i+1]} )); y=$(( 16#${b[i,i+1]} ))
+    out+=$(printf '%02x' $(( (x * (100 - pct) + y * pct + 50) / 100 )))
+  done
+  print -r -- "$out"
+}
+
+# Reads key = "value" pairs from colors.toml, then fills in the keys a theme may
+# leave out the way omarchy-theme-color does.
+load_colors() {
+  local file="$1/colors.toml" line key value
+  [[ -f $file ]] || die "$1 has no colors.toml"
+  C=()
+  while IFS= read -r line; do
+    [[ $line =~ '^[[:space:]]*([A-Za-z0-9_]+)[[:space:]]*=[[:space:]]*"([^"]*)"' ]] || continue
+    C[$match[1]]=$match[2]
+  done <"$file"
+
+  : ${C[mode]:=dark}
+  [[ -n ${C[light_foreground]:-} ]]     || C[light_foreground]=${C[color7]:-$C[foreground]}
+  [[ -n ${C[bright_foreground]:-} ]]    || C[bright_foreground]=${C[color15]:-$C[foreground]}
+  [[ -n ${C[lighter_background]:-} ]]   || C[lighter_background]=${C[color0]:-$C[background]}
+  [[ -n ${C[dark_foreground]:-} ]]      || C[dark_foreground]=${C[color8]:-$C[foreground]}
+  [[ -n ${C[muted]:-} ]]                || C[muted]=${C[color8]:-$C[dark_foreground]}
+  [[ -n ${C[selection]:-} ]]            || C[selection]=${C[selection_background]:-${C[color8]:-$C[background]}}
+  [[ -n ${C[selection_background]:-} ]] || C[selection_background]=$C[selection]
+  [[ -n ${C[selection_foreground]:-} ]] || C[selection_foreground]=$C[bright_foreground]
+  [[ -n ${C[accent]:-} ]]               || C[accent]=$C[blue]
+  [[ -n ${C[orange]:-} ]]               || C[orange]=$C[yellow]
+  [[ -n ${C[brown]:-} ]]                || C[brown]=$(mix $C[orange] "#000000" 50)
+  [[ -n ${C[dark_background]:-} ]]      || C[dark_background]=$(mix $C[background] "#000000" 25)
+  [[ -n ${C[darker_background]:-} ]]    || C[darker_background]=$(mix $C[background] "#000000" 50)
+  local base
+  for base in red yellow green cyan blue magenta; do
+    [[ -n ${C[bright_$base]:-} ]] || C[bright_$base]=$(mix $C[$base] "#ffffff" 20)
+  done
+  C[cursor]=$C[bright_foreground]
+}
+
+# Renders {{ key }}, {{ key_strip }} and {{ key_rgb }} in a template.
+render() {
+  local tpl="$1" out="$2" content key value r g b
+  content=$(<"$tpl")
+  for key value in ${(kv)C}; do
+    content=${content//"{{ ${key} }}"/$value}
+    content=${content//"{{ ${key}_strip }}"/${value#\#}}
+    if [[ $value == \#[[:xdigit:]](#c6) ]]; then
+      r=$(( 16#${value[2,3]} )); g=$(( 16#${value[4,5]} )); b=$(( 16#${value[6,7]} ))
+      content=${content//"{{ ${key}_rgb }}"/"$r,$g,$b"}
+    fi
+  done
+  [[ $content == *'{{'* ]] && print -u2 -- "omarchy-theme: unrendered tokens left in ${out:t}"
+  print -r -- "$content" >"$out"
+}
+
+# --- Building the current theme ---------------------------------------------
+
+build_current() {
+  local src="$1" tpl_dir="$REPO_DIR/default/themed" staged="$STATE_DIR/staging"
+  rm -rf "$staged" && mkdir -p "$staged"
+
+  load_colors "$src" || return 1
+
+  render "$tpl_dir/ghostty.conf.tpl" "$staged/ghostty.conf"
+  render "$tpl_dir/btop.theme.tpl" "$staged/btop.theme"
+  [[ -f $src/btop.theme ]] && cp "$src/btop.theme" "$staged/btop.theme"
+
+  # A theme's neovim.lua runs as code inside Neovim, so like Omarchy only trust
+  # the official ones and render the colors.toml template for community themes.
+  if [[ -f $src/neovim.lua ]] && ! is_user_theme "$src"; then
+    cp "$src/neovim.lua" "$staged/neovim.lua"
+  else
+    render "$tpl_dir/neovim.lua.tpl" "$staged/neovim.lua"
+  fi
+
+  cp "$src/colors.toml" "$staged/colors.toml"
+  [[ -d $src/backgrounds ]] && ln -s "$src/backgrounds" "$staged/backgrounds"
+
+  rm -rf "$CURRENT_DIR"
+  mv "$staged" "$CURRENT_DIR"
+}
+
+# --- Applying to apps -------------------------------------------------------
+
+backup_once() {
+  local file="$1"
+  [[ -e $file && ! -e $BACKUP_DIR/${file:t}.orig ]] || return 0
+  mkdir -p "$BACKUP_DIR"
+  cp "$file" "$BACKUP_DIR/${file:t}.orig"
+  info "backed up ${file/#$HOME/~} to ${BACKUP_DIR/#$HOME/~}/${file:t}.orig"
+}
+
+apply_ghostty() {
+  [[ -d /Applications/Ghostty.app ]] || return 0
+  local line="config-file = $CURRENT_DIR/ghostty.conf"
+  mkdir -p "${GHOSTTY_CONFIG:h}"
+  touch "$GHOSTTY_CONFIG"
+
+  if ! grep -qxF -- "$line" "$GHOSTTY_CONFIG"; then
+    backup_once "$GHOSTTY_CONFIG"
+    # A `theme =` line would fight the generated colors, so comment it out.
+    sed -i '' -E 's/^([[:space:]]*theme[[:space:]]*=.*)$/# \1  # replaced by omarchy-theme/' "$GHOSTTY_CONFIG"
+    print -r -- $'\n# Colors managed by omarchy-theme\n'"$line" >>"$GHOSTTY_CONFIG"
+  fi
+
+  # Ghostty reloads its config, and recolors open windows, on SIGUSR2.
+  pkill -USR2 -x ghostty 2>/dev/null || true
+  info "ghostty"
+}
+
+apply_btop() {
+  command -v btop >/dev/null || return 0
+  mkdir -p "$BTOP_DIR/themes"
+  cp "$CURRENT_DIR/btop.theme" "$BTOP_DIR/themes/omarchy-current.theme"
+
+  local conf="$BTOP_DIR/btop.conf"
+  if [[ -f $conf ]]; then
+    if ! grep -qx 'color_theme = "omarchy-current"' "$conf"; then
+      backup_once "$conf"
+      sed -i '' -E 's/^color_theme = .*/color_theme = "omarchy-current"/' "$conf"
+      grep -q '^color_theme' "$conf" || print -r -- 'color_theme = "omarchy-current"' >>"$conf"
+    fi
+  else
+    print -r -- 'color_theme = "omarchy-current"' >"$conf"
+  fi
+
+  pkill -USR2 -x btop 2>/dev/null || true
+  info "btop"
+}
+
+apply_neovim() {
+  [[ -d ${NVIM_THEME_LINK:h} ]] || return 0
+  ln -sfn "$CURRENT_DIR/neovim.lua" "$NVIM_THEME_LINK"
+
+  # Recolor running Neovims too. lazy.nvim loads a lazy colorscheme plugin when
+  # :colorscheme asks for it, so this works whenever the plugin is installed.
+  local scheme sock
+  scheme=$(sed -nE 's/.*colorscheme = "([^"]+)".*/\1/p' "$CURRENT_DIR/neovim.lua" | head -1)
+  if [[ -n $scheme ]] && command -v nvim >/dev/null; then
+    for sock in ${TMPDIR%/}/nvim.$USER/*/nvim.*.0(N=) /tmp/nvim.$USER/*/nvim.*.0(N=); do
+      nvim --server "$sock" --remote-send "<C-\\><C-n>:silent! colorscheme $scheme<CR>" >/dev/null 2>&1 || true
+    done
+  fi
+  info "neovim (${scheme:-from theme file})"
+}
+
+apply_appearance() {
+  local dark=true
+  [[ ${C[mode]} == light ]] && dark=false
+  osascript -e "tell application \"System Events\" to tell appearance preferences to set dark mode to $dark" >/dev/null 2>&1 \
+    && info "macOS appearance: ${C[mode]}"
+}
+
+backgrounds() {
+  local -a files
+  files=( "$CURRENT_DIR"/backgrounds/*.(jpg|jpeg|png|webp|heic)(N-.on) )
+  print -rl -- $files
+}
+
+set_wallpaper() {
+  local file="$1" cache="$DATA_DIR/wallpapers" out
+  [[ -f $file ]] || return 0
+
+  # Convert to PNG once, since not every macOS version takes webp wallpapers.
+  mkdir -p "$cache"
+  out="$cache/$(slugify "$(current_theme)")-${file:t:r}.png"
+  [[ -f $out ]] || sips -s format png "$file" --out "$out" >/dev/null 2>&1 || out="$file"
+
+  osascript -e "tell application \"System Events\" to tell every desktop to set picture to POSIX file \"$out\"" >/dev/null 2>&1 \
+    && { print -r -- "${file:t}" >"$STATE_DIR/background.name"; info "wallpaper ${file:t}" } \
+    || info "wallpaper: allow your terminal under Privacy & Security > Automation to set it"
+}
+
+# --- Commands ---------------------------------------------------------------
+
+cmd_update() {
+  command -v git >/dev/null || die "git is required"
+  mkdir -p "$DATA_DIR"
+  if [[ -d $REPO_DIR/.git ]]; then
+    print "Pulling the latest Omarchy themes..."
+    git -C "$REPO_DIR" pull --quiet --ff-only || die "git pull failed"
+  else
+    print "Downloading the Omarchy themes..."
+    git clone --quiet --depth 1 --filter=blob:none --sparse "$OMARCHY_REPO" "$REPO_DIR" || die "git clone failed"
+    git -C "$REPO_DIR" sparse-checkout set themes default/themed
+  fi
+
+  local dir
+  for dir in "$USER_THEMES_DIR"/*(/N); do
+    [[ -d $dir/.git ]] && { info "pulling ${dir:t}"; git -C "$dir" pull --quiet --ff-only || true }
+  done
+
+  print "$(theme_names | wc -l | tr -d ' ') themes available."
+  # Re-apply so template or color changes upstream land right away.
+  local cur=$(current_theme)
+  [[ -n $cur && -n $(theme_dir "$cur") ]] && cmd_set "$cur"
+  return 0
+}
+
+cmd_list() {
+  ensure_repo
+  local cur=$(current_theme) name
+  for name in $(theme_names); do
+    [[ $name == $cur ]] && print -r -- "* $(titleize $name)" || print -r -- "  $(titleize $name)"
+  done
+}
+
+cmd_set() {
+  [[ -n ${1:-} ]] || die "usage: omarchy-theme set <theme>"
+  ensure_repo
+  local src=$(theme_dir "$1")
+  [[ -n $src ]] || die "no theme named '$1' (see: omarchy-theme list)"
+
+  local name=${src:t}
+  print "Applying $(titleize $name)..."
+  mkdir -p "$STATE_DIR"
+  build_current "$src"
+  print -r -- "$name" >"$STATE_DIR/theme.name"
+
+  apply_ghostty
+  apply_neovim
+  apply_btop
+  apply_appearance
+  local first=$(backgrounds | head -1)
+  [[ -n $first ]] && set_wallpaper "$first"
+  return 0
+}
+
+cmd_next() {
+  ensure_repo
+  local -a names=( $(theme_names) )
+  local i=${names[(Ie)$(current_theme)]}
+  cmd_set "${names[$(( i % ${#names} + 1 ))]}"
+}
+
+cmd_bg_next() {
+  local -a files=( ${(f)"$(backgrounds)"} )
+  (( ${#files} )) || die "the current theme has no wallpapers"
+  local cur=""
+  [[ -f $STATE_DIR/background.name ]] && cur=$(<"$STATE_DIR/background.name")
+  local i=${files[(I)*/${(b)cur}]}
+  set_wallpaper "${files[$(( i % ${#files} + 1 ))]}"
+}
+
+cmd_install() {
+  local url="${1:-}"
+  [[ -n $url ]] || die "usage: omarchy-theme install <git-url>"
+  local name=${${url:t}%.git}
+  name=${name#omarchy-}; name=${name%-theme}
+  mkdir -p "$USER_THEMES_DIR"
+  [[ -e $USER_THEMES_DIR/$name ]] && die "$name is already installed"
+  git clone --quiet --depth 1 "$url" "$USER_THEMES_DIR/$name" || die "git clone failed"
+  [[ -f $USER_THEMES_DIR/$name/colors.toml ]] || {
+    rm -rf "$USER_THEMES_DIR/$name"
+    die "$url has no colors.toml, so it isn't a current-format Omarchy theme"
+  }
+  ensure_repo
+  cmd_set "$name"
+}
+
+cmd_remove() {
+  local dir="$USER_THEMES_DIR/$(slugify "${1:-}")"
+  [[ -n ${1:-} && -d $dir ]] || die "no community theme named '${1:-}'"
+  [[ $(current_theme) == ${dir:t} ]] && die "switch to another theme before removing this one"
+  rm -rf "$dir" && print "Removed ${dir:t}."
+}
+
+case "${1:-}" in
+  update)        cmd_update ;;
+  list|ls)       cmd_list ;;
+  set)           shift; cmd_set "$*" ;;
+  next)          cmd_next ;;
+  current)       titleize "$(current_theme)" ;;
+  bg-next)       cmd_bg_next ;;
+  install)       cmd_install "${2:-}" ;;
+  remove|rm)     shift; cmd_remove "$*" ;;
+  -h|--help|help|"") usage ;;
+  *)             usage; exit 1 ;;
+esac
